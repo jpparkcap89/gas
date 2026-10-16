@@ -35,10 +35,18 @@ let bridgeReady = false;
 let bridgeFrame = null;
 let bridgeOrigin = '';
 let nextCallId = 0;
-const trustedBridgeOrigins = new Set([
-  'https://script.google.com',
-  'https://script.googleusercontent.com'
-]);
+function isTrustedBridgeOrigin(origin) {
+  try {
+    const url = new URL(origin);
+    if (url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase();
+    return host === 'script.google.com' ||
+      host === 'script.googleusercontent.com' ||
+      host.endsWith('.script.googleusercontent.com');
+  } catch (_) {
+    return false;
+  }
+}
 function bridgeInit() {
   if (!/^https:\/\/script\.google\.com\/(?:macros|a\/macros)\//.test(GAS_WEB_APP_URL)
       || !/\/exec(?:\?|$)/.test(GAS_WEB_APP_URL)) {
@@ -50,17 +58,17 @@ function bridgeInit() {
   bridgeFrame.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;border:0';
   bridgeFrame.src = BRIDGE_URL;
   document.body.appendChild(bridgeFrame);
-  bridgeFrame.addEventListener('load', function() { bridgePing(); });
+  bridgeFrame.addEventListener('load', bridgePing);
 }
 function bridgePing() {
-  if (!bridgeFrame || !bridgeFrame.contentWindow) return;
-  for (const origin of trustedBridgeOrigins) {
-    bridgeFrame.contentWindow.postMessage({channel:BRIDGE_CHANNEL,kind:'ping'}, origin);
-  }
+  if (!bridgeFrame || !bridgeFrame.contentWindow || bridgeReady) return;
+  // Handshake contains no credentials. A wildcard is required because Google's
+  // HtmlService redirects to a deployment-specific googleusercontent origin.
+  bridgeFrame.contentWindow.postMessage({channel:BRIDGE_CHANNEL,kind:'ping'}, '*');
 }
 window.addEventListener('message', function(event) {
   if (!bridgeFrame || event.source !== bridgeFrame.contentWindow) return;
-  if (!trustedBridgeOrigins.has(event.origin)) return;
+  if (!isTrustedBridgeOrigin(event.origin)) return;
   const data = event.data;
   if (!data || data.channel !== BRIDGE_CHANNEL) return;
   if (data.kind === 'ready') {
@@ -69,7 +77,7 @@ window.addEventListener('message', function(event) {
     window.dispatchEvent(new Event('gas-bridge-ready'));
     return;
   }
-  if (data.kind !== 'response') return;
+  if (data.kind !== 'response' || event.origin !== bridgeOrigin) return;
   const item = pendingCalls.get(data.id);
   if (!item) return;
   pendingCalls.delete(data.id);
