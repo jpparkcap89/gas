@@ -24,88 +24,85 @@ const $=id=>document.getElementById(id);
 const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const validUrl=value=>{try{const u=new URL(/^https?:\/\//i.test(value)?value:'https://'+value);return ['http:','https:'].includes(u.protocol)?u.href:''}catch(e){return ''}};
 const toast=message=>{const el=$('toast');el.textContent=message;el.classList.add('show');clearTimeout(el.timer);el.timer=setTimeout(()=>el.classList.remove('show'),3200)};
-// GAS 웹앱 배포 후 아래 /exec URL만 실제 주소로 변경하세요.
+// JP's GAS LAB GAS deployment
 const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzACE1QQuLGoLZQmC7JiSU3o_XXlr9bXxNWTVe9L_264CwW2_6TVFGgpoccpHi3YrQ/exec';
-const BRIDGE_CHANNEL = 'CAP89_GAS_BRIDGE_V1';
-const BRIDGE_URL = GAS_WEB_APP_URL.indexOf('?') < 0
-  ? GAS_WEB_APP_URL + '?bridge=1'
-  : GAS_WEB_APP_URL + '&bridge=1';
+const BRIDGE_CHANNEL = 'CAP89_GAS_BRIDGE_V2';
+const BRIDGE_URL = GAS_WEB_APP_URL + '?bridge=1';
 const pendingCalls = new Map();
-let bridgeReady = false;
 let bridgeFrame = null;
+let bridgeReady = false;
+let bridgeWindow = null;
 let bridgeOrigin = '';
 let nextCallId = 0;
+let bridgeWaiters = [];
 function isTrustedBridgeOrigin(origin) {
   try {
-    const url = new URL(origin);
-    if (url.protocol !== 'https:') return false;
-    const host = url.hostname.toLowerCase();
-    return host === 'script.google.com' ||
-      host === 'script.googleusercontent.com' ||
-      host.endsWith('.script.googleusercontent.com');
-  } catch (_) {
-    return false;
-  }
+    const u = new URL(origin);
+    return u.protocol === 'https:' && (
+      u.hostname === 'script.google.com' ||
+      u.hostname === 'script.googleusercontent.com' ||
+      u.hostname.endsWith('.script.googleusercontent.com')
+    );
+  } catch (_) { return false; }
 }
 function bridgeInit() {
-  if (!/^https:\/\/script\.google\.com\/(?:macros|a\/macros)\//.test(GAS_WEB_APP_URL)
-      || !/\/exec(?:\?|$)/.test(GAS_WEB_APP_URL)) {
-    throw new Error('GitHub index.html의 GAS_WEB_APP_URL에 배포된 /exec 주소를 넣어 주세요.');
-  }
   bridgeFrame = document.createElement('iframe');
-  bridgeFrame.setAttribute('title', 'GAS 데이터 연결');
+  bridgeFrame.setAttribute('title', 'GAS 연결 브리지');
   bridgeFrame.setAttribute('aria-hidden', 'true');
   bridgeFrame.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;border:0';
   bridgeFrame.src = BRIDGE_URL;
   document.body.appendChild(bridgeFrame);
-  bridgeFrame.addEventListener('load', bridgePing);
-}
-function bridgePing() {
-  if (!bridgeFrame || !bridgeFrame.contentWindow || bridgeReady) return;
-  // Handshake contains no credentials. A wildcard is required because Google's
-  // HtmlService redirects to a deployment-specific googleusercontent origin.
-  bridgeFrame.contentWindow.postMessage({channel:BRIDGE_CHANNEL,kind:'ping'}, '*');
 }
 window.addEventListener('message', function(event) {
-  if (!bridgeFrame || event.source !== bridgeFrame.contentWindow) return;
-  if (!isTrustedBridgeOrigin(event.origin)) return;
+  if (!bridgeFrame || !isTrustedBridgeOrigin(event.origin)) return;
   const data = event.data;
   if (!data || data.channel !== BRIDGE_CHANNEL) return;
-  if (data.kind === 'ready') {
-    bridgeReady = true;
+  if (data.kind === 'hello') {
+    // HtmlService has an outer wrapper and a nested user iframe.
+    // Reply to the *actual sender*, not bridgeFrame.contentWindow.
+    if (bridgeReady && event.source !== bridgeWindow) return;
+    bridgeWindow = event.source;
     bridgeOrigin = event.origin;
-    window.dispatchEvent(new Event('gas-bridge-ready'));
+    bridgeWindow.postMessage({channel:BRIDGE_CHANNEL,kind:'ping'}, bridgeOrigin);
     return;
   }
-  if (data.kind !== 'response' || event.origin !== bridgeOrigin) return;
+  if (event.source !== bridgeWindow || event.origin !== bridgeOrigin) return;
+  if (data.kind === 'ready') {
+    bridgeReady = true;
+    bridgeWaiters.splice(0).forEach(fn => fn());
+    return;
+  }
+  if (data.kind !== 'response') return;
   const item = pendingCalls.get(data.id);
   if (!item) return;
   pendingCalls.delete(data.id);
   clearTimeout(item.timer);
   if (data.ok) item.resolve(data.result);
-  else item.reject(new Error(data.error || '연결 오류'));
+  else item.reject(new Error(data.error || 'GAS 연결 오류'));
 });
-async function awaitBridge() {
-  if (bridgeReady) return;
-  const started = Date.now();
-  while (!bridgeReady) {
-    if (Date.now() - started > 20000) throw new Error('GAS 브리지 연결 시간 초과. 배포 URL 및 접속 권한을 확인해 주세요.');
-    bridgePing();
-    await new Promise(r => setTimeout(r, 650));
-  }
-}
-const call = async (name, ...args) => {
-  await awaitBridge();
-  return new Promise((resolve, reject) => {
-    const id = 'req_' + (++nextCallId) + '_' + Date.now();
+function awaitBridge() {
+  if (bridgeReady) return Promise.resolve();
+  return new Promise((resolve,reject) => {
     const timer = setTimeout(() => {
+      bridgeWaiters = bridgeWaiters.filter(f=>f!==done);
+      reject(new Error('브리지 시작 신호를 받지 못했습니다. 배포 버전과 iframe 정책을 확인해 주세요.'));
+    }, 25000);
+    const done=()=>{clearTimeout(timer);resolve();};
+    bridgeWaiters.push(done);
+  });
+}
+const call = async (name,...args) => {
+  await awaitBridge();
+  return new Promise((resolve,reject) => {
+    const id='req_'+(++nextCallId)+'_'+Date.now();
+    const timer=setTimeout(()=>{
       pendingCalls.delete(id);
-      reject(new Error('GAS 응답 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.'));
-    }, 60000);
-    pendingCalls.set(id, {resolve, reject, timer});
-    bridgeFrame.contentWindow.postMessage({
-      channel:BRIDGE_CHANNEL, kind:'request', id, method:name, args
-    }, bridgeOrigin);
+      reject(new Error('GAS 응답 시간 초과'));
+    },60000);
+    pendingCalls.set(id,{resolve,reject,timer});
+    bridgeWindow.postMessage({
+      channel:BRIDGE_CHANNEL,kind:'request',id,method:name,args
+    },bridgeOrigin);
   });
 };
 const errorText=e=>e?.message||String(e);
